@@ -123,22 +123,23 @@ fn typst_issue_5509_common(document: &mut Document, name: &str) {
     surface.pop();
 }
 
-// Unfortunately since macOS 26, it seems like a new bug was introduced such that
-// the below issues render incorrectly when rendered as a thumbnail (the one shown
-// in Finder), but it still displays fine in Apple Preview. Therefore, we have
-// to disable the tests.
+// See the comment in `pdf_embedded_as_xobject_typst_issue7269`. Below 3 tests
+// cases were introduced to test behavior in MacOS, but it doesn't work correctly
+// when using Quartz directly as opposed to opening it in Finder. Therefore,
+// they need to be manually inspected. We still include them here as a test
+// and render them with PDFIum, since it doesn't hurt.
 
-#[visreg(document, pdfium, quartz, ignore)]
+#[visreg(document, pdfium)]
 fn typst_issue_5509_1(document: &mut Document) {
     typst_issue_5509_common(document, "custom_typst_issue_5509_1.svg");
 }
 
-#[visreg(document, pdfium, quartz, ignore)]
+#[visreg(document, pdfium)]
 fn typst_issue_5509_2(document: &mut Document) {
     typst_issue_5509_common(document, "custom_typst_issue_5509_2.svg");
 }
 
-#[visreg(document, pdfium, quartz, ignore)]
+#[visreg(document, pdfium)]
 fn typst_issue_5509_3(document: &mut Document) {
     typst_issue_5509_common(document, "custom_typst_issue_5509_3.svg");
 }
