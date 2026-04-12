@@ -590,7 +590,7 @@ impl Node {
         id_tree: &mut BTreeMap<TagId, Ref>,
         parent: Ref,
         note_id: &mut u32,
-        struct_elems: &mut Vec<Chunk>,
+        shared_chunk: &mut Chunk,
     ) -> KrillaResult<Option<Reference>> {
         match self {
             Node::Group(g) => Ok(Some(g.serialize(
@@ -599,7 +599,7 @@ impl Node {
                 id_tree,
                 parent,
                 note_id,
-                struct_elems,
+                shared_chunk,
             )?)),
             Node::Leaf(ci) => match ci.0 {
                 IdentifierInner::Real(rci) => Ok(Some(Reference::ContentIdentifier(rci))),
@@ -665,7 +665,7 @@ impl TagGroup {
         id_tree: &mut BTreeMap<TagId, Ref>,
         parent_ref: Ref,
         note_id: &mut u32,
-        struct_elems: &mut Vec<Chunk>,
+        shared_chunk: &mut Chunk,
     ) -> KrillaResult<Reference> {
         let elem_ref = sc.new_ref();
         let mut children_refs = vec![];
@@ -677,15 +677,14 @@ impl TagGroup {
                 id_tree,
                 elem_ref,
                 note_id,
-                struct_elems,
+                shared_chunk,
             )?;
             if let Some(ref_) = serialized {
                 children_refs.push(ref_);
             }
         }
 
-        let mut chunk = Chunk::new();
-        let mut struct_elem = chunk.struct_element(elem_ref);
+        let mut struct_elem = shared_chunk.struct_element(elem_ref);
         self.tag.write_kind(&mut struct_elem, sc);
         struct_elem.parent(parent_ref);
 
@@ -968,7 +967,6 @@ impl TagGroup {
             &mut struct_elem,
         )?;
         struct_elem.finish();
-        struct_elems.push(chunk);
 
         Ok(Reference::Ref(elem_ref))
     }
@@ -1041,7 +1039,10 @@ impl TagTree {
         struct_tree_ref: Ref,
     ) -> KrillaResult<(Ref, Vec<Chunk>)> {
         let root_ref = sc.new_ref();
-        let mut struct_elems = vec![];
+        // Use a single shared Chunk for ALL struct elements instead of one
+        // per TagGroup. This reduces memory from O(N) Chunk allocations
+        // (each ~1 KB) to a single growing buffer.
+        let mut shared_chunk = Chunk::new();
 
         // Keeps track of the ID of notes in the IDTree. We currently only write IDs for notes,
         // which is why we use this simple variable, but this should be refactored if we write
@@ -1057,7 +1058,7 @@ impl TagTree {
                 id_tree_map,
                 root_ref,
                 &mut note_id,
-                &mut struct_elems,
+                &mut shared_chunk,
             )?;
 
             if let Some(ref_) = serialized {
@@ -1065,8 +1066,7 @@ impl TagTree {
             }
         }
 
-        let mut chunk = Chunk::new();
-        let mut struct_elem = chunk.indirect(root_ref).start::<StructElement>();
+        let mut struct_elem = shared_chunk.indirect(root_ref).start::<StructElement>();
         struct_elem.kind(StructRole::Document);
         struct_elem.parent(struct_tree_ref);
         if let Some(lang) = &self.lang {
@@ -1083,13 +1083,10 @@ impl TagTree {
         )?;
 
         struct_elem.finish();
-        struct_elems.push(chunk);
 
-        // Not strictly necessary, but it's nicer to have them in DFS-order instead
-        // of in reverse.
-        struct_elems = struct_elems.into_iter().rev().collect::<Vec<_>>();
-
-        Ok((root_ref, struct_elems))
+        // Return the single shared chunk as a one-element Vec for API
+        // compatibility with ChunkContainer::struct_elements.
+        Ok((root_ref, vec![shared_chunk]))
     }
 
     pub(crate) fn validate(&self, id_tree: &BTreeMap<TagId, Ref>) -> KrillaResult<()> {
