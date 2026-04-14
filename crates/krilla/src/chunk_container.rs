@@ -49,7 +49,7 @@ impl ChunkContainer {
         Self::default()
     }
 
-    pub(crate) fn finish(self, sc: &mut SerializeContext) -> KrillaResult<Pdf> {
+    pub(crate) fn finish(mut self, sc: &mut SerializeContext) -> KrillaResult<Pdf> {
         let mut remapped_ref = Ref::new(1);
         let mut remapper = HashMap::new();
 
@@ -73,7 +73,7 @@ impl ChunkContainer {
 
         // Chunk length is not an exact number because the length might change as we renumber,
         // so we add a bit of a padding by multiplying with 1.1. The 200 is additional padding
-        // for the document catalog. This hopefully allows us to avoid re-alloactions in the general
+        // for the document catalog. This hopefully allows us to avoid re-allocations in the general
         // case, and thus give us better performance.
         let capacity = (chunks_byte_len as f32 * 1.1 + 200.0) as usize;
         let mut pdf = Pdf::with_capacity(capacity);
@@ -85,20 +85,37 @@ impl ChunkContainer {
             pdf.set_binary_marker(b"AAAA")
         }
 
-        // Write the chunks in all the fields.
-        self.visit(sc, &mut |chunk| {
-            chunk.renumber_into(&mut pdf, |old| remapper[&old]);
-        })?;
+        // Extract catalog-related info BEFORE consuming chunks, since
+        // visit_consuming moves self and drops all chunk data.
+        let page_tree_ref = self.page_tree.as_ref().map(|(r, _)| remapper[r]);
+        let outline_ref = self.outline.as_ref().map(|(r, _)| remapper[r]);
+        let page_label_tree_ref = self.page_label_tree.as_ref().map(|(r, _)| remapper[r]);
+        let destination_profiles_ref = self.destination_profiles.as_ref().map(|(r, _)| remapper[r]);
+        let struct_tree_root_ref = self.struct_tree_root.as_ref().map(|(r, _)| remapper[r]);
+        let has_catalog = page_tree_ref.is_some()
+            || outline_ref.is_some()
+            || page_label_tree_ref.is_some()
+            || destination_profiles_ref.is_some()
+            || struct_tree_root_ref.is_some();
+        let num_pages = self.pages.len() as u32;
+        let metadata = self.metadata.take();
+        let has_no_embedded_files = self.embedded_files.is_empty();
 
-        let missing_title = self.metadata.as_ref().is_none_or(|m| m.title.is_none());
+        // Write chunks into the PDF, consuming (dropping) each field after
+        // renumbering to free memory before the PDF buffer grows large.
+        // This avoids the struct_elements (268 MB) and final PDF (257 MB)
+        // coexisting simultaneously.
+        self.visit_consuming(sc, &mut pdf, &remapper)?;
+
+        let missing_title = metadata.as_ref().is_none_or(|m| m.title.is_none());
 
         if missing_title {
             sc.register_validation_error(ValidationError::NoDocumentTitle);
         }
 
         // Write the PDF document info metadata.
-        if let Some(metadata) = &self.metadata {
-            metadata.serialize_document_info(
+        if let Some(ref meta) = metadata {
+            meta.serialize_document_info(
                 &mut remapped_ref,
                 &mut pdf,
                 sc.serialize_settings().configuration,
@@ -107,14 +124,14 @@ impl ChunkContainer {
 
         let instance_id = stable_hash_base64(pdf.as_bytes());
 
-        let document_id = if let Some(metadata) = &self.metadata {
-            if let Some(document_id) = &metadata.document_id {
+        let document_id = if let Some(ref meta) = metadata {
+            if let Some(document_id) = &meta.document_id {
                 stable_hash_base64(&(sc.serialize_settings().pdf_version().as_str(), document_id))
-            } else if metadata.title.is_some() && metadata.authors.is_some() {
+            } else if meta.title.is_some() && meta.authors.is_some() {
                 stable_hash_base64(&(
                     sc.serialize_settings().pdf_version().as_str(),
-                    &metadata.title,
-                    &metadata.authors,
+                    &meta.title,
+                    &meta.authors,
                 ))
             } else {
                 instance_id.clone()
@@ -124,13 +141,13 @@ impl ChunkContainer {
         };
 
         let mut xmp = XmpWriter::new();
-        if let Some(metadata) = &self.metadata {
-            metadata.serialize_xmp_metadata(&mut xmp, sc, &instance_id);
+        if let Some(ref meta) = metadata {
+            meta.serialize_xmp_metadata(&mut xmp, sc, &instance_id);
         }
 
         sc.serialize_settings().validator().write_xmp(&mut xmp);
 
-        xmp.num_pages(self.pages.len() as u32);
+        xmp.num_pages(num_pages);
         xmp.format("application/pdf");
         xmp.instance_id(&instance_id);
         xmp.document_id(&document_id);
@@ -147,13 +164,8 @@ impl ChunkContainer {
 
         // We only write a catalog if a page tree exists. Every valid PDF must have one
         // and krilla ensures that there always is one, but for snapshot tests, it can be
-        // useful to not write a document catalog if we don't actually need it for the test.
-        if self.page_tree.is_some()
-            || self.outline.is_some()
-            || self.page_label_tree.is_some()
-            || self.destination_profiles.is_some()
-            || self.struct_tree_root.is_some()
-        {
+        // useful to not write a document catalog if we don’t actually need it for the test.
+        if has_catalog {
             let meta_ref = if sc.serialize_settings().xmp_metadata {
                 let meta_ref = remapped_ref.bump();
                 let xmp_buf = xmp.finish(None);
@@ -169,36 +181,36 @@ impl ChunkContainer {
 
             let mut catalog = pdf.catalog(catalog_ref);
 
-            if let Some(pt) = &self.page_tree {
-                catalog.pages(remapper[&pt.0]);
+            if let Some(pt_ref) = page_tree_ref {
+                catalog.pages(pt_ref);
             }
 
             if let Some(meta_ref) = meta_ref {
                 catalog.metadata(meta_ref);
             }
 
-            if let Some(pl) = &self.page_label_tree {
-                catalog.pair(Name(b"PageLabels"), remapper[&pl.0]);
+            if let Some(pl_ref) = page_label_tree_ref {
+                catalog.pair(Name(b"PageLabels"), pl_ref);
             }
 
-            if let Some(oi) = &self.destination_profiles {
-                catalog.pair(Name(b"OutputIntents"), remapper[&oi.0]);
+            if let Some(oi_ref) = destination_profiles_ref {
+                catalog.pair(Name(b"OutputIntents"), oi_ref);
             }
 
-            if let Some(lang) = self.metadata.as_ref().and_then(|m| m.language.as_ref()) {
+            if let Some(lang) = metadata.as_ref().and_then(|m| m.language.as_ref()) {
                 catalog.lang(TextStr(lang));
             } else {
                 sc.register_validation_error(ValidationError::NoDocumentLanguage);
             }
 
-            if let Some(st) = &self.struct_tree_root {
-                catalog.pair(Name(b"StructTreeRoot"), remapper[&st.0]);
+            if let Some(st_ref) = struct_tree_root_ref {
+                catalog.pair(Name(b"StructTreeRoot"), st_ref);
                 let mut mark_info = catalog.mark_info();
                 mark_info.marked(true);
                 if sc.serialize_settings().pdf_version() >= PdfVersion::Pdf16
                     && sc.serialize_settings().pdf_version() < PdfVersion::Pdf20
                 {
-                    // We always set suspects to false because it's required by PDF/UA.
+                    // We always set suspects to false because it’s required by PDF/UA.
                     mark_info.suspects(false);
                 }
                 mark_info.finish();
@@ -208,7 +220,7 @@ impl ChunkContainer {
                 .serialize_settings()
                 .validator()
                 .requires_display_doc_title();
-            let text_direction = self.metadata.as_ref().and_then(|m| m.text_direction);
+            let text_direction = metadata.as_ref().and_then(|m| m.text_direction);
 
             if write_doc_title || text_direction.is_some() {
                 let mut vp = catalog.viewer_preferences();
@@ -222,7 +234,7 @@ impl ChunkContainer {
                 }
             }
 
-            let page_layout = self.metadata.as_ref().and_then(|m| m.page_layout);
+            let page_layout = metadata.as_ref().and_then(|m| m.page_layout);
             if let Some(layout) = page_layout {
                 // TwoPageLeft and TwoPageRight are only available PDF 1.5+
                 if sc.serialize_settings().pdf_version() >= PdfVersion::Pdf15
@@ -232,17 +244,17 @@ impl ChunkContainer {
                 }
             }
 
-            if let Some(ol) = &self.outline {
-                catalog.outlines(remapper[&ol.0]);
+            if let Some(ol_ref) = outline_ref {
+                catalog.outlines(ol_ref);
             }
 
             let write_embedded_files = sc
                 .serialize_settings()
                 .validator()
-                .write_embedded_files(self.embedded_files.is_empty());
+                .write_embedded_files(has_no_embedded_files);
 
             if !named_destinations.is_empty() || write_embedded_files {
-                // Cannot use pdf-writer API here because it requires Ref's, while
+                // Cannot use pdf-writer API here because it requires Ref’s, while
                 // we write our destinations directly into the array.
                 let mut names = catalog.names();
 
@@ -309,6 +321,23 @@ trait Visit {
     fn visit(&self, sc: &mut SerializeContext, f: &mut impl FnMut(&Chunk)) -> KrillaResult<()>;
 }
 
+/// Consuming visit: renumbers chunks into the PDF and drops them.
+trait VisitConsuming {
+    fn visit_consuming(self, sc: &mut SerializeContext, pdf: &mut Pdf, remapper: &HashMap<Ref, Ref>) -> KrillaResult<()>;
+}
+
+impl VisitConsuming for EmbeddedPdfChunk {
+    fn visit_consuming(self, sc: &mut SerializeContext, pdf: &mut Pdf, remapper: &HashMap<Ref, Ref>) -> KrillaResult<()> {
+        // Use the cached renumbered chunk if available, otherwise renumber now.
+        let renumbered = self.new_chunk.into_inner().unwrap_or_else(|| {
+            let mut inner_remapper = self.root_ref_mappings;
+            self.original_chunk
+                .renumber(|old| *inner_remapper.entry(old).or_insert_with(|| sc.new_ref()))
+        });
+        renumbered.visit_consuming(sc, pdf, remapper)
+    }
+}
+
 impl Visit for EmbeddedPdfChunk {
     fn visit(&self, sc: &mut SerializeContext, f: &mut impl FnMut(&Chunk)) -> KrillaResult<()> {
         // Now, we have a chunk that contains everything we need to fully embed the PDF, including
@@ -362,6 +391,36 @@ impl Visit for ChunkContainer {
     }
 }
 
+impl ChunkContainer {
+    /// Consuming visit: renumber each chunk into the PDF and drop it immediately.
+    /// This reduces peak memory by freeing large chunks (struct_elements, pages)
+    /// before the PDF buffer grows to its full size.
+    fn visit_consuming(self, sc: &mut SerializeContext, pdf: &mut Pdf, remapper: &HashMap<Ref, Ref>) -> KrillaResult<()> {
+        self.page_tree.visit_consuming(sc, pdf, remapper)?;
+        self.outline.visit_consuming(sc, pdf, remapper)?;
+        self.page_label_tree.visit_consuming(sc, pdf, remapper)?;
+        self.destination_profiles.visit_consuming(sc, pdf, remapper)?;
+        self.struct_tree_root.visit_consuming(sc, pdf, remapper)?;
+        self.struct_elements.visit_consuming(sc, pdf, remapper)?;
+        self.page_labels.visit_consuming(sc, pdf, remapper)?;
+        self.annotations.visit_consuming(sc, pdf, remapper)?;
+        self.fonts.visit_consuming(sc, pdf, remapper)?;
+        self.color_spaces.visit_consuming(sc, pdf, remapper)?;
+        self.icc_profiles.visit_consuming(sc, pdf, remapper)?;
+        self.destinations.visit_consuming(sc, pdf, remapper)?;
+        self.ext_g_states.visit_consuming(sc, pdf, remapper)?;
+        self.masks.visit_consuming(sc, pdf, remapper)?;
+        self.x_objects.visit_consuming(sc, pdf, remapper)?;
+        self.shading_functions.visit_consuming(sc, pdf, remapper)?;
+        self.patterns.visit_consuming(sc, pdf, remapper)?;
+        self.pages.visit_consuming(sc, pdf, remapper)?;
+        self.images.visit_consuming(sc, pdf, remapper)?;
+        self.embedded_files.visit_consuming(sc, pdf, remapper)?;
+        self.embedded_pdfs.visit_consuming(sc, pdf, remapper)?;
+        Ok(())
+    }
+}
+
 impl Visit for Chunk {
     fn visit(&self, _: &mut SerializeContext, f: &mut impl FnMut(&Chunk)) -> KrillaResult<()> {
         f(self);
@@ -394,6 +453,50 @@ impl<T: Visit> Visit for Vec<T> {
     fn visit(&self, sc: &mut SerializeContext, f: &mut impl FnMut(&Chunk)) -> KrillaResult<()> {
         for field in self {
             field.visit(sc, f)?;
+        }
+        Ok(())
+    }
+}
+
+// --- Consuming visit implementations ---
+
+impl VisitConsuming for Chunk {
+    fn visit_consuming(self, _: &mut SerializeContext, pdf: &mut Pdf, remapper: &HashMap<Ref, Ref>) -> KrillaResult<()> {
+        self.renumber_into(pdf, |old| remapper[&old]);
+        Ok(())
+    }
+}
+
+impl VisitConsuming for Option<(Ref, Chunk)> {
+    fn visit_consuming(self, sc: &mut SerializeContext, pdf: &mut Pdf, remapper: &HashMap<Ref, Ref>) -> KrillaResult<()> {
+        if let Some((_, chunk)) = self {
+            chunk.visit_consuming(sc, pdf, remapper)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: Visit + Send + Sync + 'static> VisitConsuming for Deferred<T> {
+    fn visit_consuming(self, sc: &mut SerializeContext, pdf: &mut Pdf, remapper: &HashMap<Ref, Ref>) -> KrillaResult<()> {
+        // Deferred values can't be easily moved out (Arc<OnceCell<T>>).
+        // Wait for the value, then use the borrowing Visit to renumber.
+        // The Deferred is dropped after this call, freeing the Arc.
+        self.wait().visit(sc, &mut |chunk| {
+            chunk.renumber_into(pdf, |old| remapper[&old]);
+        })
+    }
+}
+
+impl<T: VisitConsuming> VisitConsuming for KrillaResult<T> {
+    fn visit_consuming(self, sc: &mut SerializeContext, pdf: &mut Pdf, remapper: &HashMap<Ref, Ref>) -> KrillaResult<()> {
+        self?.visit_consuming(sc, pdf, remapper)
+    }
+}
+
+impl<T: VisitConsuming> VisitConsuming for Vec<T> {
+    fn visit_consuming(self, sc: &mut SerializeContext, pdf: &mut Pdf, remapper: &HashMap<Ref, Ref>) -> KrillaResult<()> {
+        for field in self {
+            field.visit_consuming(sc, pdf, remapper)?;
         }
         Ok(())
     }
