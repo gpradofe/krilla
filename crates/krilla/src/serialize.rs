@@ -25,7 +25,9 @@ use crate::interactive::destination::{NamedDestination, XyzDestination};
 use crate::interchange::embed::EmbeddedFile;
 use crate::interchange::metadata::Metadata;
 use crate::interchange::outline::Outline;
-use crate::interchange::tagging::{AnnotationIdentifier, PageTagIdentifier, TagTree};
+use crate::interchange::tagging::{
+    AnnotationIdentifier, PageTagIdentifier, PreSerializedTags, TagTree,
+};
 use crate::page::{InternalPage, PageLabel, PageLabelContainer};
 #[cfg(feature = "pdf")]
 use crate::pdf::{PdfDocument, PdfSerializerContext};
@@ -242,6 +244,10 @@ pub(crate) struct SerializeContext {
     validation_store: ValidationStore,
     /// The current location, if set.
     pub(crate) location: Option<Location>,
+    /// Pre-serialized tag data from TagSerializer, merged during
+    /// serialize_tag_tree. Allows streaming tag serialization to avoid
+    /// building the full tag tree in memory.
+    pub(crate) pre_serialized_tags: Option<PreSerializedTags>,
 }
 
 impl SerializeContext {
@@ -271,6 +277,7 @@ impl SerializeContext {
             serialize_settings: Arc::new(serialize_settings),
             limits: Limits::new(),
             validation_store: ValidationStore::new(),
+            pre_serialized_tags: None,
         }
     }
 
@@ -720,18 +727,34 @@ impl SerializeContext {
         let tag_tree = self.global_objects.tag_tree.take();
         let struct_parents = self.global_objects.struct_parents.take();
         if let Some(root) = tag_tree {
-            let mut parent_tree_map = HashMap::new();
-            let mut id_tree_map = BTreeMap::new();
+            // Start from pre-serialized state if available. This allows
+            // TagSerializer to pre-serialize subtrees (e.g. table rows)
+            // during resolve, avoiding the full tag tree in memory.
+            let pre = self.pre_serialized_tags.take();
+            let (mut parent_tree_map, mut id_tree_map, start_note_id, pre_chunk) =
+                if let Some(pre) = pre {
+                    (pre.parent_tree_map, pre.id_tree_map, pre.note_id, Some(pre.shared_chunk))
+                } else {
+                    (HashMap::new(), BTreeMap::new(), 1, None)
+                };
+
             let struct_tree_root_ref = self.new_ref();
             // Use consuming serialize: frees tree nodes during serialization,
             // reducing peak memory from O(tree + chunk) to O(max(tree, chunk)).
             // Validation is performed inline during serialization.
-            let (document_ref, struct_elems) = root.serialize_consuming(
+            let (document_ref, mut struct_elems) = root.serialize_consuming_with_note_id(
                 self,
                 &mut parent_tree_map,
                 &mut id_tree_map,
                 struct_tree_root_ref,
+                start_note_id,
             )?;
+
+            // Merge pre-serialized struct element chunks.
+            if let Some(chunk) = pre_chunk {
+                struct_elems.push(chunk);
+            }
+
             self.chunk_container.struct_elements = struct_elems;
 
             let mut chunk = Chunk::new();
