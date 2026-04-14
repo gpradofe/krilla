@@ -134,6 +134,10 @@ use std::io::Write as _;
 use pdf_writer::types::{ArtifactSubtype, RoleMapOpts, StructRole, StructRole2};
 use pdf_writer::writers::{PropertyList, StructElement};
 use pdf_writer::{Chunk, Finish, Name, Ref, Str, TextStr};
+
+/// Re-export `pdf_writer::Ref` so consumers can construct `Node::Ref`
+/// entries without depending on `pdf_writer` directly.
+pub use pdf_writer::Ref as PdfRef;
 use smallvec::SmallVec;
 
 use crate::configure::{PdfVersion, ValidationError};
