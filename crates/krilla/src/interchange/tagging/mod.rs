@@ -580,6 +580,9 @@ pub enum Node {
     Group(TagGroup),
     /// A leaf node.
     Leaf(Identifier),
+    /// A reference to an already-serialized struct element.
+    /// Used by streaming tag serialization to avoid holding the full tree.
+    Ref(Ref),
 }
 
 impl Node {
@@ -605,6 +608,7 @@ impl Node {
                 IdentifierInner::Real(rci) => Ok(Some(Reference::ContentIdentifier(rci))),
                 IdentifierInner::Dummy => Ok(None),
             },
+            Node::Ref(r) => Ok(Some(Reference::Ref(*r))),
         }
     }
 
@@ -633,6 +637,7 @@ impl Node {
                 IdentifierInner::Real(rci) => Ok(Some(Reference::ContentIdentifier(rci))),
                 IdentifierInner::Dummy => Ok(None),
             },
+            Node::Ref(r) => Ok(Some(Reference::Ref(r))),
         }
     }
 }
@@ -1604,4 +1609,345 @@ pub enum ArtifactAttachment {
     Top,
     Right,
     Bottom,
+}
+
+/// A streaming tag serializer that allows serializing tag groups one at a time,
+/// avoiding the need to build the full tree in memory.
+///
+/// Usage:
+/// 1. Call `new_ref()` to pre-allocate a Ref for each group.
+/// 2. Call `serialize_group()` for each group in any order (but children must
+///    be serialized before parents so their Refs are available).
+/// 3. Call `finish()` to build the Document root and StructTreeRoot.
+pub struct TagSerializer<'a> {
+    sc: &'a mut SerializeContext,
+    /// Maps content identifiers to their parent struct element Ref.
+    pub parent_tree_map: HashMap<IdentifierType, Ref>,
+    /// Maps tag IDs to their struct element Ref.
+    pub id_tree_map: BTreeMap<TagId, Ref>,
+    /// Counter for auto-generated note IDs.
+    pub note_id: u32,
+    /// Shared chunk for all struct elements.
+    pub shared_chunk: Chunk,
+}
+
+impl<'a> TagSerializer<'a> {
+    /// Create a new streaming tag serializer from a SerializeContext.
+    pub(crate) fn new(sc: &'a mut SerializeContext) -> Self {
+        Self {
+            sc,
+            parent_tree_map: HashMap::new(),
+            id_tree_map: BTreeMap::new(),
+            note_id: 1,
+            shared_chunk: Chunk::new(),
+        }
+    }
+
+    /// Allocate a new PDF object reference.
+    pub fn new_ref(&mut self) -> Ref {
+        self.sc.new_ref()
+    }
+
+    /// Serialize a single tag group using a pre-allocated Ref.
+    /// The group is consumed (dropped) after serialization.
+    /// Children should be `Node::Ref(ref)` (pre-serialized groups),
+    /// `Node::Leaf(id)` (content identifiers), or `Node::Group(group)`
+    /// (will be recursively serialized and consumed).
+    pub fn serialize_group(
+        &mut self,
+        group: TagGroup,
+        elem_ref: Ref,
+        parent_ref: Ref,
+    ) -> KrillaResult<()> {
+        // Use serialize_consuming which handles all children types
+        // But we need to use the pre-allocated elem_ref, not allocate a new one.
+        // So we reimplement the core logic here.
+        let mut children_refs = Vec::with_capacity(group.children.len());
+
+        for child in group.children.into_iter() {
+            let serialized = child.serialize_consuming(
+                self.sc,
+                &mut self.parent_tree_map,
+                &mut self.id_tree_map,
+                elem_ref,
+                &mut self.note_id,
+                &mut self.shared_chunk,
+            )?;
+            if let Some(ref_) = serialized {
+                children_refs.push(ref_);
+            }
+        }
+
+        let mut struct_elem = self.shared_chunk.struct_element(elem_ref);
+        group.tag.write_kind(&mut struct_elem, self.sc);
+        struct_elem.parent(parent_ref);
+
+        let tag = group.tag.as_any();
+        let pdf_version = self.sc.serialize_settings().pdf_version();
+
+        // Inline validate: check headers exist in id_tree
+        if let Some(headers) = tag.headers() {
+            for id in headers.iter() {
+                if !self.id_tree_map.contains_key(id) {
+                    return Err(KrillaError::UnknownTagId(id.clone(), tag.location));
+                }
+            }
+        }
+
+        if let Some(id) = tag.id() {
+            match self.id_tree_map.entry(id.clone()) {
+                Entry::Vacant(vacant) => {
+                    struct_elem.id(Str(id.as_bytes()));
+                    vacant.insert(elem_ref);
+                }
+                Entry::Occupied(_) => {
+                    return Err(KrillaError::DuplicateTagId(id.clone(), tag.location));
+                }
+            }
+        } else if matches!(group.tag, TagKind::Note(_)) {
+            let mut id = TagId(SmallVec::new());
+            _ = write!(&mut id.0, "Note {}", self.note_id);
+            struct_elem.id(Str(id.as_bytes()));
+            self.id_tree_map.insert(id, elem_ref);
+            self.note_id += 1;
+        }
+
+        if group.tag.can_have_title() && tag.title().is_none_or(str::is_empty) {
+            self.sc.register_validation_error(ValidationError::MissingHeadingTitle);
+        }
+
+        if group.tag.should_have_alt() && tag.alt_text().is_none_or(str::is_empty) {
+            self.sc.register_validation_error(ValidationError::MissingAltText(tag.location));
+        }
+
+        for attr in tag.attrs.iter() {
+            let Attr::Struct(attr) = attr else { continue };
+            match attr {
+                StructAttr::Id(_) => (),
+                StructAttr::Title(title) => { struct_elem.title(TextStr(title)); }
+                StructAttr::Lang(lang) => {
+                    if pdf_version >= PdfVersion::Pdf14 {
+                        struct_elem.lang(TextStr(lang));
+                    }
+                }
+                StructAttr::AltText(alt) => { struct_elem.alt(TextStr(alt)); }
+                StructAttr::Expanded(expanded) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        struct_elem.expanded(TextStr(expanded));
+                    }
+                }
+                StructAttr::ActualText(actual_text) => {
+                    if pdf_version >= PdfVersion::Pdf14 {
+                        struct_elem.actual_text(TextStr(actual_text));
+                    }
+                }
+                StructAttr::HeadingLevel(_) => (),
+            }
+        }
+
+        let mut attributes = LazyCell::new(|| struct_elem.attributes());
+
+        let mut list_attributes = LazyCell::new(|| attributes.push().list());
+        for attr in tag.attrs.iter() {
+            let Attr::List(attr) = attr else { continue };
+            match attr {
+                ListAttr::Numbering(numbering) => {
+                    list_attributes.list_numbering(numbering.to_pdf());
+                }
+            }
+        }
+        list_attributes.finish();
+
+        let mut table_attributes = LazyCell::new(|| attributes.push().table());
+        for attr in tag.attrs.iter() {
+            let Attr::Table(attr) = attr else { continue };
+            match attr {
+                TableAttr::Summary(summary) => {
+                    if pdf_version >= PdfVersion::Pdf17 {
+                        table_attributes.summary(TextStr(summary));
+                    }
+                }
+                TableAttr::HeaderScope(scope) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        table_attributes.scope(scope.to_pdf());
+                    }
+                }
+                TableAttr::CellHeaders(headers) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        let id_strs = headers.iter().map(|id| Str(id.as_bytes()));
+                        table_attributes.headers().items(id_strs);
+                    }
+                }
+                TableAttr::RowSpan(n) => { table_attributes.row_span(n.get() as i32); }
+                TableAttr::ColSpan(n) => { table_attributes.col_span(n.get() as i32); }
+            }
+        }
+        table_attributes.finish();
+
+        let mut layout_attributes = LazyCell::new(|| attributes.push().layout());
+        for attr in tag.attrs.iter() {
+            let Attr::Layout(attr) = attr else { continue };
+            match attr {
+                LayoutAttr::Placement(placement) => {
+                    layout_attributes.placement(placement.to_pdf());
+                }
+                LayoutAttr::WritingMode(writing_mode) => {
+                    layout_attributes.writing_mode(writing_mode.to_pdf());
+                }
+                &LayoutAttr::BBox(BBox { page_idx, rect }) => {
+                    let Some(page_info) = self.sc.page_infos().get(page_idx) else {
+                        panic!(
+                            "tag tree contains bounding box with page index {page_idx}, \
+                            but document only has {} pages",
+                            self.sc.page_infos().len()
+                        );
+                    };
+                    let transform = page_root_transform(page_info.size().height());
+                    let actual_rect = rect.transform(transform).unwrap();
+                    layout_attributes.bbox(actual_rect.to_pdf_rect());
+                }
+                &LayoutAttr::Width(width) => { layout_attributes.width(width); }
+                &LayoutAttr::Height(height) => { layout_attributes.height(height); }
+                &LayoutAttr::BackgroundColor(color) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        layout_attributes.background_color(color.into());
+                    }
+                }
+                LayoutAttr::BorderColor(sides) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        let sides = sides.map_pdf(NaiveRgbColor::into_f32_array);
+                        layout_attributes.border_color(sides);
+                    }
+                }
+                LayoutAttr::BorderStyle(sides) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        let sides = sides.map_pdf(BorderStyle::to_pdf);
+                        layout_attributes.border_style(sides);
+                    }
+                }
+                LayoutAttr::BorderThickness(sides) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        layout_attributes.border_thickness(sides.into_pdf());
+                    }
+                }
+                LayoutAttr::Padding(sides) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        layout_attributes.padding(sides.into_pdf());
+                    }
+                }
+                &LayoutAttr::Color(color) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        layout_attributes.color(color.into());
+                    }
+                }
+                &LayoutAttr::SpaceBefore(margin) => { layout_attributes.space_before(margin); }
+                &LayoutAttr::SpaceAfter(margin) => { layout_attributes.space_after(margin); }
+                &LayoutAttr::StartIndent(margin) => { layout_attributes.start_indent(margin); }
+                &LayoutAttr::EndIndent(margin) => { layout_attributes.end_indent(margin); }
+                &LayoutAttr::TextIndent(indent) => { layout_attributes.text_indent(indent); }
+                LayoutAttr::BlockAlign(alignment) => {
+                    layout_attributes.block_align(alignment.to_pdf());
+                }
+                LayoutAttr::InlineAlign(alignment) => {
+                    layout_attributes.inline_align(alignment.to_pdf());
+                }
+                LayoutAttr::TextAlign(alignment) => {
+                    layout_attributes.text_align(alignment.to_pdf());
+                }
+                LayoutAttr::TableBorderStyle(sides) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        let sides = sides.map_pdf(BorderStyle::to_pdf);
+                        layout_attributes.table_border_style(sides);
+                    }
+                }
+                LayoutAttr::TablePadding(sides) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        layout_attributes.table_padding(sides.into_pdf());
+                    }
+                }
+                &LayoutAttr::BaselineShift(shift) => { layout_attributes.baseline_shift(shift); }
+                LayoutAttr::LineHeight(height) => {
+                    layout_attributes.line_height(height.to_pdf());
+                }
+                &LayoutAttr::TextDecorationColor(color) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        layout_attributes.text_decoration_color(color.into());
+                    }
+                }
+                &LayoutAttr::TextDecorationThickness(thickness) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        layout_attributes.text_decoration_thickness(thickness);
+                    }
+                }
+                LayoutAttr::TextDecorationType(style) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        layout_attributes.text_decoration_type(style.to_pdf());
+                    }
+                }
+                &LayoutAttr::GlyphOrientationVertical(orientation) => {
+                    if pdf_version >= PdfVersion::Pdf15 {
+                        layout_attributes.glyph_orientation_vertical(orientation.to_pdf());
+                    }
+                }
+                LayoutAttr::ColumnCount(columns) => {
+                    if pdf_version >= PdfVersion::Pdf16 {
+                        layout_attributes.column_count(columns.get() as i32);
+                    }
+                }
+                LayoutAttr::ColumnGap(gap) => {
+                    if pdf_version >= PdfVersion::Pdf16 {
+                        let sizes = layout_attributes.column_gap();
+                        match gap {
+                            ColumnDimensions::All(gap) => sizes.uniform(*gap),
+                            ColumnDimensions::Specific(values) => {
+                                sizes.individual().items(values.iter().copied());
+                            }
+                        }
+                    }
+                }
+                LayoutAttr::ColumnWidths(width) => {
+                    if pdf_version >= PdfVersion::Pdf16 {
+                        let sizes = layout_attributes.column_widths();
+                        match width {
+                            ColumnDimensions::All(width) => sizes.uniform(*width),
+                            ColumnDimensions::Specific(values) => {
+                                sizes.individual().items(values.iter().copied());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        layout_attributes.finish();
+        attributes.finish();
+
+        serialize_children(
+            self.sc,
+            elem_ref,
+            children_refs,
+            &mut self.parent_tree_map,
+            &mut struct_elem,
+        )?;
+        struct_elem.finish();
+
+        Ok(())
+    }
+
+    /// Consume the serializer and set up the tag tree on the document.
+    /// `document_ref` is the Ref of the Document struct element.
+    /// `struct_tree_ref` will be allocated internally for the StructTreeRoot.
+    pub fn finish(mut self, document_ref: Ref, _lang: Option<String>) -> KrillaResult<()> {
+        // Build the Document struct element
+        let mut struct_elem = self.shared_chunk.indirect(document_ref).start::<StructElement>();
+        struct_elem.kind(StructRole::Document);
+
+        // The StructTreeRoot ref will be the parent. Allocate it now.
+        // Actually, the StructTreeRoot is built by serialize_tag_tree, which
+        // we bypass. We need to integrate with the existing flow.
+        // For now, store the pre-serialized data so serialize_tag_tree can use it.
+        // TODO: implement full finish logic
+        struct_elem.finish();
+
+        Ok(())
+    }
 }

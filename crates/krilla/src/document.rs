@@ -19,7 +19,7 @@ use crate::error::KrillaResult;
 use crate::interchange::embed::EmbeddedFile;
 use crate::interchange::metadata::Metadata;
 use crate::interchange::outline::Outline;
-use crate::interchange::tagging::TagTree;
+use crate::interchange::tagging::{TagSerializer, TagTree};
 use crate::page::{Page, PageSettings};
 #[cfg(feature = "pdf")]
 use crate::pdf::PdfDocument;
@@ -98,6 +98,18 @@ impl Document {
     /// Set the tag tree of the document.
     pub fn set_tag_tree(&mut self, tag_tree: TagTree) {
         self.serializer_context.set_tag_tree(tag_tree);
+    }
+
+    /// Create a streaming tag serializer for incremental tag tree construction.
+    /// This allows serializing tag groups one at a time during resolve,
+    /// avoiding the need to build the full tree in memory.
+    pub fn tag_serializer(&mut self) -> TagSerializer<'_> {
+        TagSerializer::new(&mut self.serializer_context)
+    }
+
+    /// Allocate a new PDF object reference.
+    pub fn new_ref(&mut self) -> pdf_writer::Ref {
+        self.serializer_context.new_ref()
     }
 
     /// Embed a new file in the PDF document.

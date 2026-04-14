@@ -96,6 +96,7 @@ impl Output for Node {
                 )
             }
             Node::Leaf(Identifier(IdentifierInner::Dummy)) => writeln!(f, "{indent}- Artifact"),
+            Node::Ref(r) => writeln!(f, "{indent}- PreSerialized: ref={}", r.get()),
         }
     }
 }
