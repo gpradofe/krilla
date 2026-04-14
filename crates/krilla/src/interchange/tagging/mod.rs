@@ -1473,6 +1473,7 @@ impl TagTree {
             id_tree_map,
             struct_tree_ref,
             1,
+            None,
         )
     }
 
@@ -1486,8 +1487,9 @@ impl TagTree {
         id_tree_map: &mut BTreeMap<TagId, Ref>,
         struct_tree_ref: Ref,
         start_note_id: u32,
+        pre_allocated_root_ref: Option<Ref>,
     ) -> KrillaResult<(Ref, Vec<Chunk>)> {
-        let root_ref = sc.new_ref();
+        let root_ref = pre_allocated_root_ref.unwrap_or_else(|| sc.new_ref());
         let mut shared_chunk = Chunk::new();
         let mut note_id = start_note_id;
         let mut children_refs = Vec::with_capacity(self.children.len());
@@ -1638,6 +1640,10 @@ pub enum ArtifactAttachment {
 /// Pre-serialized tag data produced by [`TagSerializer`]. Stored in
 /// [`SerializeContext`] and merged during `serialize_tag_tree`.
 pub struct PreSerializedTags {
+    /// Pre-allocated Ref for the Document struct element. Must be used
+    /// by `serialize_consuming` instead of allocating a new one, so that
+    /// pre-serialized children's /P entries are consistent.
+    pub document_ref: Ref,
     /// Maps content identifiers to their parent struct element Ref.
     pub parent_tree_map: HashMap<IdentifierType, Ref>,
     /// Maps tag IDs to their struct element Ref.
@@ -1659,6 +1665,10 @@ pub struct PreSerializedTags {
 ///    SerializeContext for merging during `Document::finish()`.
 pub struct TagSerializer<'a> {
     sc: &'a mut SerializeContext,
+    /// Pre-allocated Ref for the Document struct element.
+    /// Root children use this as their parent_ref so that
+    /// serialize_consuming later uses the same Ref.
+    document_ref: Ref,
     /// Maps content identifiers to their parent struct element Ref.
     parent_tree_map: HashMap<IdentifierType, Ref>,
     /// Maps tag IDs to their struct element Ref.
@@ -1671,14 +1681,24 @@ pub struct TagSerializer<'a> {
 
 impl<'a> TagSerializer<'a> {
     /// Create a new streaming tag serializer from a SerializeContext.
+    /// Pre-allocates a Ref for the Document struct element so that
+    /// all root children can reference it as their parent.
     pub(crate) fn new(sc: &'a mut SerializeContext) -> Self {
+        let document_ref = sc.new_ref();
         Self {
             sc,
+            document_ref,
             parent_tree_map: HashMap::new(),
             id_tree_map: BTreeMap::new(),
             note_id: 1,
             shared_chunk: Chunk::new(),
         }
+    }
+
+    /// Returns the pre-allocated Document struct element Ref.
+    /// Root children should use this as their parent_ref.
+    pub fn document_ref(&self) -> Ref {
+        self.document_ref
     }
 
     /// Allocate a new PDF object reference.
@@ -1690,6 +1710,7 @@ impl<'a> TagSerializer<'a> {
     /// Must be called before `Document::finish()`.
     pub fn finish_into(self) {
         self.sc.pre_serialized_tags = Some(PreSerializedTags {
+            document_ref: self.document_ref,
             parent_tree_map: self.parent_tree_map,
             id_tree_map: self.id_tree_map,
             note_id: self.note_id,
