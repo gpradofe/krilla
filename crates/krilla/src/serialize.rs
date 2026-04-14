@@ -719,19 +719,20 @@ impl SerializeContext {
     fn serialize_tag_tree(&mut self) -> KrillaResult<()> {
         let tag_tree = self.global_objects.tag_tree.take();
         let struct_parents = self.global_objects.struct_parents.take();
-        if let Some(root) = &tag_tree {
+        if let Some(root) = tag_tree {
             let mut parent_tree_map = HashMap::new();
             let mut id_tree_map = BTreeMap::new();
             let struct_tree_root_ref = self.new_ref();
-            let (document_ref, struct_elems) = root.serialize(
+            // Use consuming serialize: frees tree nodes during serialization,
+            // reducing peak memory from O(tree + chunk) to O(max(tree, chunk)).
+            // Validation is performed inline during serialization.
+            let (document_ref, struct_elems) = root.serialize_consuming(
                 self,
                 &mut parent_tree_map,
                 &mut id_tree_map,
                 struct_tree_root_ref,
             )?;
             self.chunk_container.struct_elements = struct_elems;
-
-            root.validate(&id_tree_map)?;
 
             let mut chunk = Chunk::new();
             let mut tree = chunk
