@@ -1457,15 +1457,35 @@ impl TagTree {
     /// rather than as a separate pass. This reduces peak memory from
     /// O(tree + chunk) to O(max(tree_start, chunk_end)).
     pub(crate) fn serialize_consuming(
-        mut self,
+        self,
         sc: &mut SerializeContext,
         parent_tree_map: &mut HashMap<IdentifierType, Ref>,
         id_tree_map: &mut BTreeMap<TagId, Ref>,
         struct_tree_ref: Ref,
     ) -> KrillaResult<(Ref, Vec<Chunk>)> {
+        self.serialize_consuming_with_note_id(
+            sc,
+            parent_tree_map,
+            id_tree_map,
+            struct_tree_ref,
+            1,
+        )
+    }
+
+    /// Like [`serialize_consuming`](Self::serialize_consuming) but with a
+    /// custom starting note ID. Used when some groups were pre-serialized
+    /// via [`TagSerializer`] and their note IDs should not collide.
+    pub(crate) fn serialize_consuming_with_note_id(
+        mut self,
+        sc: &mut SerializeContext,
+        parent_tree_map: &mut HashMap<IdentifierType, Ref>,
+        id_tree_map: &mut BTreeMap<TagId, Ref>,
+        struct_tree_ref: Ref,
+        start_note_id: u32,
+    ) -> KrillaResult<(Ref, Vec<Chunk>)> {
         let root_ref = sc.new_ref();
         let mut shared_chunk = Chunk::new();
-        let mut note_id = 1;
+        let mut note_id = start_note_id;
         let mut children_refs = Vec::with_capacity(self.children.len());
 
         // Consume children, freeing each subtree after serialization.
@@ -1611,24 +1631,38 @@ pub enum ArtifactAttachment {
     Bottom,
 }
 
+/// Pre-serialized tag data produced by [`TagSerializer`]. Stored in
+/// [`SerializeContext`] and merged during `serialize_tag_tree`.
+pub struct PreSerializedTags {
+    /// Maps content identifiers to their parent struct element Ref.
+    pub parent_tree_map: HashMap<IdentifierType, Ref>,
+    /// Maps tag IDs to their struct element Ref.
+    pub id_tree_map: BTreeMap<TagId, Ref>,
+    /// Counter for auto-generated note IDs (next available).
+    pub note_id: u32,
+    /// Shared chunk containing all pre-serialized struct elements.
+    pub shared_chunk: Chunk,
+}
+
 /// A streaming tag serializer that allows serializing tag groups one at a time,
 /// avoiding the need to build the full tree in memory.
 ///
 /// Usage:
 /// 1. Call `new_ref()` to pre-allocate a Ref for each group.
-/// 2. Call `serialize_group()` for each group in any order (but children must
-///    be serialized before parents so their Refs are available).
-/// 3. Call `finish()` to build the Document root and StructTreeRoot.
+/// 2. Call `serialize_group()` for each group in bottom-up order (children
+///    must be serialized before parents so their Refs are available).
+/// 3. Call `finish_into()` to store the pre-serialized data back into the
+///    SerializeContext for merging during `Document::finish()`.
 pub struct TagSerializer<'a> {
     sc: &'a mut SerializeContext,
     /// Maps content identifiers to their parent struct element Ref.
-    pub parent_tree_map: HashMap<IdentifierType, Ref>,
+    parent_tree_map: HashMap<IdentifierType, Ref>,
     /// Maps tag IDs to their struct element Ref.
-    pub id_tree_map: BTreeMap<TagId, Ref>,
+    id_tree_map: BTreeMap<TagId, Ref>,
     /// Counter for auto-generated note IDs.
-    pub note_id: u32,
+    note_id: u32,
     /// Shared chunk for all struct elements.
-    pub shared_chunk: Chunk,
+    shared_chunk: Chunk,
 }
 
 impl<'a> TagSerializer<'a> {
@@ -1648,6 +1682,17 @@ impl<'a> TagSerializer<'a> {
         self.sc.new_ref()
     }
 
+    /// Store the pre-serialized data back into the SerializeContext.
+    /// Must be called before `Document::finish()`.
+    pub fn finish_into(self) {
+        self.sc.pre_serialized_tags = Some(PreSerializedTags {
+            parent_tree_map: self.parent_tree_map,
+            id_tree_map: self.id_tree_map,
+            note_id: self.note_id,
+            shared_chunk: self.shared_chunk,
+        });
+    }
+
     /// Serialize a single tag group using a pre-allocated Ref.
     /// The group is consumed (dropped) after serialization.
     /// Children should be `Node::Ref(ref)` (pre-serialized groups),
@@ -1659,9 +1704,7 @@ impl<'a> TagSerializer<'a> {
         elem_ref: Ref,
         parent_ref: Ref,
     ) -> KrillaResult<()> {
-        // Use serialize_consuming which handles all children types
-        // But we need to use the pre-allocated elem_ref, not allocate a new one.
-        // So we reimplement the core logic here.
+        // Serialize children first, collecting their references.
         let mut children_refs = Vec::with_capacity(group.children.len());
 
         for child in group.children.into_iter() {
@@ -1933,21 +1976,4 @@ impl<'a> TagSerializer<'a> {
         Ok(())
     }
 
-    /// Consume the serializer and set up the tag tree on the document.
-    /// `document_ref` is the Ref of the Document struct element.
-    /// `struct_tree_ref` will be allocated internally for the StructTreeRoot.
-    pub fn finish(mut self, document_ref: Ref, _lang: Option<String>) -> KrillaResult<()> {
-        // Build the Document struct element
-        let mut struct_elem = self.shared_chunk.indirect(document_ref).start::<StructElement>();
-        struct_elem.kind(StructRole::Document);
-
-        // The StructTreeRoot ref will be the parent. Allocate it now.
-        // Actually, the StructTreeRoot is built by serialize_tag_tree, which
-        // we bypass. We need to integrate with the existing flow.
-        // For now, store the pre-serialized data so serialize_tag_tree can use it.
-        // TODO: implement full finish logic
-        struct_elem.finish();
-
-        Ok(())
-    }
 }
