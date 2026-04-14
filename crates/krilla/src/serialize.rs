@@ -731,11 +731,11 @@ impl SerializeContext {
             // TagSerializer to pre-serialize subtrees (e.g. table rows)
             // during resolve, avoiding the full tag tree in memory.
             let pre = self.pre_serialized_tags.take();
-            let (mut parent_tree_map, mut id_tree_map, start_note_id, pre_chunk) =
+            let (mut parent_tree_map, mut id_tree_map, start_note_id, pre_chunk, pre_doc_ref) =
                 if let Some(pre) = pre {
-                    (pre.parent_tree_map, pre.id_tree_map, pre.note_id, Some(pre.shared_chunk))
+                    (pre.parent_tree_map, pre.id_tree_map, pre.note_id, Some(pre.shared_chunk), Some(pre.document_ref))
                 } else {
-                    (HashMap::new(), BTreeMap::new(), 1, None)
+                    (HashMap::new(), BTreeMap::new(), 1, None, None)
                 };
 
             let struct_tree_root_ref = self.new_ref();
@@ -748,6 +748,7 @@ impl SerializeContext {
                 &mut id_tree_map,
                 struct_tree_root_ref,
                 start_note_id,
+                pre_doc_ref,
             )?;
 
             // Merge pre-serialized struct element chunks.
