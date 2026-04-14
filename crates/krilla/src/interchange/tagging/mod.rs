@@ -587,6 +587,12 @@ pub enum Node {
     /// A reference to an already-serialized struct element.
     /// Used by streaming tag serialization to avoid holding the full tree.
     Ref(Ref),
+    /// A group node with a pre-allocated Ref. During serialization, this Ref
+    /// is used instead of allocating a new one. This is needed when some
+    /// children were pre-serialized with this Ref as their parent, but the
+    /// group itself couldn't be pre-serialized (e.g., it has annotation
+    /// descendants that need page info not yet available).
+    PreAllocGroup(Ref, TagGroup),
 }
 
 impl Node {
@@ -600,7 +606,7 @@ impl Node {
         shared_chunk: &mut Chunk,
     ) -> KrillaResult<Option<Reference>> {
         match self {
-            Node::Group(g) => Ok(Some(g.serialize(
+            Node::Group(g) | Node::PreAllocGroup(_, g) => Ok(Some(g.serialize(
                 sc,
                 parent_tree_map,
                 id_tree,
@@ -636,6 +642,15 @@ impl Node {
                 parent,
                 note_id,
                 shared_chunk,
+            )?)),
+            Node::PreAllocGroup(pre_ref, g) => Ok(Some(g.serialize_consuming_with_ref(
+                sc,
+                parent_tree_map,
+                id_tree,
+                parent,
+                note_id,
+                shared_chunk,
+                pre_ref,
             )?)),
             Node::Leaf(ci) => match ci.0 {
                 IdentifierInner::Real(rci) => Ok(Some(Reference::ContentIdentifier(rci))),
@@ -1029,7 +1044,7 @@ impl TagGroup {
     /// serialization. Each child subtree is freed after being serialized,
     /// reducing peak memory from O(tree_size) to O(depth * sibling_count).
     pub(crate) fn serialize_consuming(
-        mut self,
+        self,
         sc: &mut SerializeContext,
         parent_tree_map: &mut HashMap<IdentifierType, Ref>,
         id_tree: &mut BTreeMap<TagId, Ref>,
@@ -1038,6 +1053,35 @@ impl TagGroup {
         shared_chunk: &mut Chunk,
     ) -> KrillaResult<Reference> {
         let elem_ref = sc.new_ref();
+        self.serialize_consuming_inner(sc, parent_tree_map, id_tree, parent_ref, note_id, shared_chunk, elem_ref)
+    }
+
+    /// Like `serialize_consuming` but uses a pre-allocated Ref instead of
+    /// allocating a new one. Used for `Node::PreAllocGroup` where children
+    /// were already serialized with this Ref as their parent.
+    pub(crate) fn serialize_consuming_with_ref(
+        self,
+        sc: &mut SerializeContext,
+        parent_tree_map: &mut HashMap<IdentifierType, Ref>,
+        id_tree: &mut BTreeMap<TagId, Ref>,
+        parent_ref: Ref,
+        note_id: &mut u32,
+        shared_chunk: &mut Chunk,
+        pre_ref: Ref,
+    ) -> KrillaResult<Reference> {
+        self.serialize_consuming_inner(sc, parent_tree_map, id_tree, parent_ref, note_id, shared_chunk, pre_ref)
+    }
+
+    fn serialize_consuming_inner(
+        mut self,
+        sc: &mut SerializeContext,
+        parent_tree_map: &mut HashMap<IdentifierType, Ref>,
+        id_tree: &mut BTreeMap<TagId, Ref>,
+        parent_ref: Ref,
+        note_id: &mut u32,
+        shared_chunk: &mut Chunk,
+        elem_ref: Ref,
+    ) -> KrillaResult<Reference> {
         let mut children_refs = Vec::with_capacity(self.children.len());
 
         // Consume children in order. We use drain(..) which yields in order
