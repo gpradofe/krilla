@@ -5,7 +5,7 @@
 //! in the document via [`Document::set_metadata`].
 //!
 //! [`Document::set_metadata`]: crate::document::Document::set_metadata
-use pdf_writer::{Finish, Pdf, Ref, TextStr};
+use pdf_writer::{Chunk, Finish, Pdf, Ref, TextStr};
 use std::cell::LazyCell;
 use xmp_writer::{LangId, Timezone, XmpWriter};
 
@@ -283,6 +283,50 @@ impl Metadata {
                     document_info.creator(TextStr(creator));
                 }
 
+                if let Some(producer) = &self.producer {
+                    document_info.producer(TextStr(producer));
+                }
+            }
+
+            if let Some(date_time) = self.creation_date {
+                document_info.modified_date(pdf_date(date_time));
+                document_info.creation_date(pdf_date(date_time));
+            }
+        }
+    }
+
+    /// Like `serialize_document_info` but writes to a Chunk instead of a Pdf.
+    pub(crate) fn serialize_document_info_to_chunk(
+        &self,
+        chunk: &mut Chunk,
+        ref_: Ref,
+        config: Configuration,
+    ) {
+        if !config.validator().allows_info_dict() {
+            return;
+        }
+
+        if self.has_document_info() {
+            let mut document_info = LazyCell::new(|| chunk.indirect(ref_).start::<pdf_writer::writers::DocumentInfo>());
+
+            if config.version() < PdfVersion::Pdf20 {
+                if let Some(title) = &self.title {
+                    document_info.title(TextStr(title));
+                }
+                if let Some(description) = &self.description {
+                    document_info.subject(TextStr(description));
+                }
+                if let Some(keywords) = &self.keywords {
+                    let joined = keywords.join(", ");
+                    document_info.keywords(TextStr(&joined));
+                }
+                if let Some(authors) = &self.authors {
+                    let joined = authors.join(", ");
+                    document_info.author(TextStr(&joined));
+                }
+                if let Some(creator) = &self.creator {
+                    document_info.creator(TextStr(creator));
+                }
                 if let Some(producer) = &self.producer {
                     document_info.producer(TextStr(producer));
                 }

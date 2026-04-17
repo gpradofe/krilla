@@ -1694,8 +1694,12 @@ pub struct PreSerializedTags {
     pub id_tree_map: BTreeMap<TagId, Ref>,
     /// Counter for auto-generated note IDs (next available).
     pub note_id: u32,
-    /// Shared chunk containing all pre-serialized struct elements.
-    pub shared_chunk: Chunk,
+    /// Small chunks (final shared_chunk for small documents).
+    /// Empty when disk_chunks is used.
+    pub chunks: Vec<Chunk>,
+    /// Disk-backed chunks for large documents. Contains all flushed
+    /// struct element data on disk instead of in memory.
+    pub disk_chunks: Option<crate::chunk_container::DiskChunks>,
 }
 
 /// A streaming tag serializer that allows serializing tag groups one at a time,
@@ -1719,8 +1723,12 @@ pub struct TagSerializer<'a> {
     id_tree_map: BTreeMap<TagId, Ref>,
     /// Counter for auto-generated note IDs.
     note_id: u32,
-    /// Shared chunk for all struct elements.
+    /// Current chunk for struct elements being serialized.
     shared_chunk: Chunk,
+    /// Disk-backed storage for flushed chunks. Created lazily on first
+    /// flush. For large documents, chunks are written to a temp file
+    /// instead of accumulated in memory.
+    disk_chunks: Option<crate::chunk_container::DiskChunks>,
 }
 
 impl<'a> TagSerializer<'a> {
@@ -1735,7 +1743,9 @@ impl<'a> TagSerializer<'a> {
             parent_tree_map: HashMap::new(),
             id_tree_map: BTreeMap::new(),
             note_id: 1,
-            shared_chunk: Chunk::new(),
+            // Pre-allocate 1 MB. Flushed to disk at 512 KB to cap peak memory.
+            shared_chunk: Chunk::with_capacity(1024 * 1024),
+            disk_chunks: None,
         }
     }
 
@@ -1752,13 +1762,35 @@ impl<'a> TagSerializer<'a> {
 
     /// Store the pre-serialized data back into the SerializeContext.
     /// Must be called before `Document::finish()`.
-    pub fn finish_into(self) {
+    pub fn finish_into(mut self) {
+        // Flush remaining chunk data.
+        if self.shared_chunk.len() > 0 {
+            let remaining = std::mem::replace(&mut self.shared_chunk, Chunk::new());
+            if let Some(ref mut disk) = self.disk_chunks {
+                // Large document: write final chunk to disk too.
+                disk.push(remaining).expect("failed to write final tag chunk to disk");
+            } else {
+                // Small document: no disk chunks were created.
+                // Store the single remaining chunk in memory.
+                self.sc.pre_serialized_tags = Some(PreSerializedTags {
+                    document_ref: self.document_ref,
+                    parent_tree_map: self.parent_tree_map,
+                    id_tree_map: self.id_tree_map,
+                    note_id: self.note_id,
+                    chunks: vec![remaining],
+                    disk_chunks: None,
+                });
+                return;
+            }
+        }
+        // Large document (or empty): store disk chunks.
         self.sc.pre_serialized_tags = Some(PreSerializedTags {
             document_ref: self.document_ref,
             parent_tree_map: self.parent_tree_map,
             id_tree_map: self.id_tree_map,
             note_id: self.note_id,
-            shared_chunk: self.shared_chunk,
+            chunks: Vec::new(),
+            disk_chunks: self.disk_chunks,
         });
     }
 
@@ -2042,7 +2074,37 @@ impl<'a> TagSerializer<'a> {
         )?;
         struct_elem.finish();
 
+        // Periodically flush the shared_chunk to prevent it from growing to
+        // hundreds of MB for large documents. Each flushed chunk goes into
+        // struct_elements in the ChunkContainer where it will be written
+        // during finish/finish_streaming.
+        self.maybe_flush_chunk();
+
         Ok(())
+    }
+
+    /// Flush the shared_chunk to disk when it exceeds a threshold.
+    /// Uses small buffers (1 MB) with frequent flushes (512 KB) to keep
+    /// peak memory low. Old buffer is dropped before new one is allocated
+    /// to avoid both coexisting in memory.
+    fn maybe_flush_chunk(&mut self) {
+        const FLUSH_THRESHOLD: usize = 512 * 1024; // 512 KB
+        const BUFFER_CAPACITY: usize = 1024 * 1024; // 1 MB
+        if self.shared_chunk.len() > FLUSH_THRESHOLD {
+            // Take old chunk without allocating replacement yet.
+            let full = std::mem::replace(
+                &mut self.shared_chunk,
+                Chunk::new(),
+            );
+            // Write to disk and drop old buffer.
+            let disk = self.disk_chunks.get_or_insert_with(|| {
+                crate::chunk_container::DiskChunks::new()
+                    .expect("failed to create temp file for tag chunks")
+            });
+            disk.push(full).expect("failed to write tag chunk to disk");
+            // Now allocate fresh buffer (old is gone).
+            self.shared_chunk = Chunk::with_capacity(BUFFER_CAPACITY);
+        }
     }
 
 }

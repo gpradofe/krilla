@@ -45,4 +45,6 @@ pub enum KrillaError {
     /// supported by the used PDF version (only available in PDF 1.5+).
     #[cfg(feature = "raster-images")]
     SixteenBitImage(Image, Option<Location>),
+    /// An I/O error during streaming PDF output.
+    Io(String),
 }
