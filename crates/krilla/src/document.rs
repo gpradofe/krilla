@@ -137,4 +137,14 @@ impl Document {
 
         Ok(self.serializer_context.finish()?.finish())
     }
+
+    /// Stream the PDF directly to a writer, avoiding a large in-memory buffer.
+    /// This is more memory-efficient than `finish()` for large documents.
+    pub fn finish_to_writer<W: std::io::Write>(mut self, writer: W) -> KrillaResult<()> {
+        if self.serializer_context.page_infos().is_empty() {
+            self.start_page();
+        }
+
+        self.serializer_context.finish_streaming(writer)
+    }
 }

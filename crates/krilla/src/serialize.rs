@@ -443,6 +443,45 @@ impl SerializeContext {
 
         Ok(pdf)
     }
+
+    /// Stream the PDF directly to a writer, avoiding a large in-memory buffer.
+    /// This is more memory-efficient than `finish()` for large documents.
+    pub(crate) fn finish_streaming<W: std::io::Write>(mut self, writer: W) -> KrillaResult<()> {
+        // Same serialization order as finish()
+        self.serialize_destination_profiles();
+        self.serialize_page_label_tree();
+        self.serialize_outline()?;
+        self.serialize_fonts()?;
+        self.serialize_pages()?;
+        self.serialize_page_tree();
+        #[cfg(feature = "pdf")]
+        self.serialize_embedded_pdfs()?;
+        self.serialize_xyz_destinations()?;
+        self.serialize_tag_tree()?;
+
+        // Stream the PDF to the writer instead of building in memory
+        let chunk_container = std::mem::take(&mut self.chunk_container);
+        chunk_container.finish_streaming(&mut self, writer)?;
+
+        // Check for validation errors (same logic as finish())
+        if !self.validation_errors.is_empty() {
+            let mut errors = vec![];
+            let mut seen = HashSet::new();
+
+            for error in self.validation_errors {
+                if !seen.contains(&error) {
+                    seen.insert(error.clone());
+                    errors.push(error);
+                }
+            }
+
+            return Err(KrillaError::Validation(errors));
+        }
+
+        self.global_objects.assert_all_taken();
+
+        Ok(())
+    }
 }
 
 /// Various registration methods.
@@ -731,11 +770,11 @@ impl SerializeContext {
             // TagSerializer to pre-serialize subtrees (e.g. table rows)
             // during resolve, avoiding the full tag tree in memory.
             let pre = self.pre_serialized_tags.take();
-            let (mut parent_tree_map, mut id_tree_map, start_note_id, pre_chunk, pre_doc_ref) =
+            let (mut parent_tree_map, mut id_tree_map, start_note_id, pre_chunk, pre_disk_chunks, pre_doc_ref) =
                 if let Some(pre) = pre {
-                    (pre.parent_tree_map, pre.id_tree_map, pre.note_id, Some(pre.shared_chunk), Some(pre.document_ref))
+                    (pre.parent_tree_map, pre.id_tree_map, pre.note_id, Some(pre.chunks), pre.disk_chunks, Some(pre.document_ref))
                 } else {
-                    (HashMap::new(), BTreeMap::new(), 1, None, None)
+                    (HashMap::new(), BTreeMap::new(), 1, None, None, None)
                 };
 
             let struct_tree_root_ref = self.new_ref();
@@ -751,12 +790,18 @@ impl SerializeContext {
                 pre_doc_ref,
             )?;
 
-            // Merge pre-serialized struct element chunks.
-            if let Some(chunk) = pre_chunk {
-                struct_elems.push(chunk);
+            // Merge pre-serialized struct element chunks (in-memory).
+            if let Some(pre_chunks) = pre_chunk {
+                struct_elems.extend(pre_chunks);
             }
 
             self.chunk_container.struct_elements = struct_elems;
+
+            // Store disk-backed struct elements (if any) for streaming
+            // during ChunkContainer::finish/finish_streaming.
+            if let Some(disk) = pre_disk_chunks {
+                self.chunk_container.disk_struct_elements = Some(disk);
+            }
 
             let mut chunk = Chunk::new();
             let mut tree = chunk
