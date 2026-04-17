@@ -1,0 +1,33 @@
+[package]
+name = "pdf-writer"
+version = "0.14.0"
+authors = ["Laurenz <laurmaedje@gmail.com>", "Martin Haug <mhaug@live.de>"]
+edition = "2021"
+description = "A step-by-step PDF writer (vendored, with disk-backed-storage extensions)."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/typst/pdf-writer"
+keywords = ["pdf", "writer"]
+categories = ["encoding", "multimedia"]
+
+[lib]
+name = "pdf_writer"
+path = "src/lib.rs"
+
+[dependencies]
+bitflags = "2"
+itoa = "1"
+memchr = "2"
+ryu = "1"
+
+[dev-dependencies]
+iai = "0.1"
+image = { version = "0.25", features = ["png", "jpeg"], default-features = false }
+jpeg-decoder = "0.3.1"
+jpeg-encoder = "0.6.0"
+miniz_oxide = "0.8"
+
+[[bench]]
+name = "oneshot"
+path = "benches/oneshot.rs"
+harness = false
