@@ -2088,7 +2088,13 @@ impl<'a> TagSerializer<'a> {
     /// peak memory low. Old buffer is dropped before new one is allocated
     /// to avoid both coexisting in memory.
     fn maybe_flush_chunk(&mut self) {
-        const FLUSH_THRESHOLD: usize = 512 * 1024; // 512 KB
+        // Disk spill disabled: measurement at 100K/1.2M showed it costs
+        // 36-87 MB (likely due to I/O staging + renumber reload overhead)
+        // without a compensating benefit. We keep the scaffolding so the
+        // tag-serialization infrastructure is otherwise unchanged — just
+        // never triggered. If a future workload proves disk spill actually
+        // pays off, flip this threshold back to `512 * 1024` to re-enable.
+        const FLUSH_THRESHOLD: usize = usize::MAX;
         const BUFFER_CAPACITY: usize = 1024 * 1024; // 1 MB
         if self.shared_chunk.len() > FLUSH_THRESHOLD {
             // Take old chunk without allocating replacement yet.
