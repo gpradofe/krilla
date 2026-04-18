@@ -2088,7 +2088,10 @@ impl<'a> TagSerializer<'a> {
     /// peak memory low. Old buffer is dropped before new one is allocated
     /// to avoid both coexisting in memory.
     fn maybe_flush_chunk(&mut self) {
-        const FLUSH_THRESHOLD: usize = 512 * 1024; // 512 KB
+        // MEASUREMENT-ONLY: disable disk flushing by raising the threshold
+        // to effectively infinity. Used to isolate the memory contribution
+        // of disk-backed struct-element chunks.
+        const FLUSH_THRESHOLD: usize = usize::MAX;
         const BUFFER_CAPACITY: usize = 1024 * 1024; // 1 MB
         if self.shared_chunk.len() > FLUSH_THRESHOLD {
             // Take old chunk without allocating replacement yet.
