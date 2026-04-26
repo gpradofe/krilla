@@ -1213,7 +1213,7 @@ dependencies = [
 [[package]]
 name = "pdf-writer"
 version = "0.14.0"
-source = "git+https://github.com/gpradofe/pdf-writer.git?rev=afc2a1ac70b50eea552aa0fae90eac82cbb506d6#afc2a1ac70b50eea552aa0fae90eac82cbb506d6"
+source = "git+https://github.com/gpradofe/pdf-writer.git?rev=9f738764a0db29474d366f3761c98c8a9a03d30a#9f738764a0db29474d366f3761c98c8a9a03d30a"
 dependencies = [
  "bitflags 2.10.0",
  "itoa",
