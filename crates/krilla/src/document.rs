@@ -165,4 +165,22 @@ impl Document {
 
         Ok(serializer_context.finish(chunk_container)?.finish())
     }
+
+    /// Variant of [`Self::finish`] that streams the final PDF body to a
+    /// [`std::io::Write`] target instead of returning a `Vec<u8>`.
+    ///
+    /// This is the entry point [`typst-pdf`] uses to write the PDF
+    /// directly to disk without holding the whole serialized buffer in
+    /// memory. The current implementation calls [`Self::finish`]
+    /// internally and writes the resulting buffer in one shot — i.e.
+    /// the buffer is still produced in memory before the write — so
+    /// peak RSS is the same as `finish`. A future change can swap this
+    /// to a true incremental writer; the API is in place so callers
+    /// don't have to change.
+    pub fn finish_to_writer<W: std::io::Write>(self, mut writer: W) -> KrillaResult<()> {
+        let buf = self.finish()?;
+        writer
+            .write_all(&buf)
+            .map_err(|e| crate::error::KrillaError::Io(e.to_string()))
+    }
 }
