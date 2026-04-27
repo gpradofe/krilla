@@ -144,6 +144,11 @@ use crate::serialize::SerializeContext;
 
 pub use tag::*;
 
+/// Re-export of `pdf_writer::Ref` so external consumers (e.g. typst-pdf) can
+/// hold pre-allocated refs for [`Node::Ref`] / [`Node::PreAllocGroup`] /
+/// [`TagSerializer`] without a direct dependency on the `pdf-writer` crate.
+pub use pdf_writer::Ref as PdfRef;
+
 pub mod fmt;
 mod tag;
 
@@ -581,6 +586,21 @@ pub enum Node {
     Group(TagGroup),
     /// A leaf node.
     Leaf(Identifier),
+    /// A reference to an already-serialized struct element. Produced by
+    /// [`TagSerializer::serialize_group`] when a subtree is pre-serialized
+    /// during the document build (rather than carried in memory until
+    /// [`Document::set_tag_tree`]). The resulting parent's children list
+    /// can therefore mix in-memory groups with already-flushed refs.
+    Ref(PdfRef),
+    /// A group node with a pre-allocated [`PdfRef`]. Used when some
+    /// children were pre-serialized with this ref as their `/P` parent
+    /// (typically because they are leaves or refs), but the group itself
+    /// could not be fully pre-serialized — for example because it contains
+    /// an annotation descendant whose page info isn't available yet.
+    /// During tag-tree serialization the supplied ref is used in place of
+    /// allocating a fresh one, so the pre-serialized children's `/P`
+    /// entries stay consistent.
+    PreAllocGroup(PdfRef, TagGroup),
 }
 
 impl Node {
@@ -594,7 +614,7 @@ impl Node {
         struct_elems: &mut Chunk,
     ) -> KrillaResult<Option<Reference>> {
         match self {
-            Node::Group(g) => Ok(Some(g.serialize(
+            Node::Group(g) | Node::PreAllocGroup(_, g) => Ok(Some(g.serialize(
                 sc,
                 parent_tree_map,
                 id_tree,
@@ -606,6 +626,7 @@ impl Node {
                 IdentifierInner::Real(rci) => Ok(Some(Reference::ContentIdentifier(rci))),
                 IdentifierInner::Dummy => Ok(None),
             },
+            Node::Ref(r) => Ok(Some(Reference::Ref(*r))),
         }
     }
 }

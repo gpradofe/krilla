@@ -96,6 +96,11 @@ impl Output for Node {
                 )
             }
             Node::Leaf(Identifier(IdentifierInner::Dummy)) => writeln!(f, "{indent}- Artifact"),
+            Node::Ref(r) => writeln!(f, "{indent}- Ref({})", r.get()),
+            Node::PreAllocGroup(r, g) => {
+                writeln!(f, "{indent}- PreAllocGroup({})", r.get())?;
+                g.output_indent(f, indent.inc())
+            }
         }
     }
 }
