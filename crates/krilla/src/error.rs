@@ -52,6 +52,9 @@ pub enum KrillaError {
     /// supported by the used PDF version (only available in PDF 1.5+).
     #[cfg(feature = "raster-images")]
     SixteenBitImage(Image, Option<Location>),
+    /// I/O failure while writing the PDF body to a [`std::io::Write`]
+    /// target via [`crate::Document::finish_to_writer`].
+    Io(String),
 }
 
 /// A limit imposed by the selected PDF version.

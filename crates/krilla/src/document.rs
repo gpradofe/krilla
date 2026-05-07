@@ -116,6 +116,24 @@ impl Document {
         self.serializer_context.set_tag_tree(tag_tree);
     }
 
+    /// Open a streaming `TagSerializer`.
+    ///
+    /// Returns a borrowed serializer over this document's serialize
+    /// context. Use it to pre-serialize tag subtrees while the document
+    /// is being built (e.g. flushing each table row as the document
+    /// author finishes writing that row), instead of holding the whole
+    /// tag tree in memory until [`Self::set_tag_tree`].
+    ///
+    /// Refs returned by `TagSerializer::new_ref` / `TagSerializer::document_ref`
+    /// should be wrapped in [`crate::tagging::Node::Ref`] /
+    /// [`crate::tagging::Node::PreAllocGroup`] inside the final tag tree
+    /// handed to [`Self::set_tag_tree`]. Call `TagSerializer::finish_into`
+    /// before [`Self::finish`] to commit the pre-serialized state back to
+    /// this document.
+    pub fn tag_serializer(&mut self) -> crate::tagging::TagSerializer<'_> {
+        crate::tagging::TagSerializer::new(&mut self.serializer_context)
+    }
+
     /// Embed a new file in the PDF document.
     ///
     /// Returns `None` if the file couldn't be embedded because a file
@@ -152,5 +170,23 @@ impl Document {
         } = self;
 
         Ok(serializer_context.finish(chunk_container)?.finish())
+    }
+
+    /// Variant of [`Self::finish`] that streams the final PDF body to a
+    /// [`std::io::Write`] target instead of returning a `Vec<u8>`.
+    ///
+    /// This is the entry point `typst-pdf` uses to write the PDF
+    /// directly to disk without holding the whole serialized buffer in
+    /// memory. The current implementation calls [`Self::finish`]
+    /// internally and writes the resulting buffer in one shot — i.e.
+    /// the buffer is still produced in memory before the write — so
+    /// peak RSS is the same as `finish`. A future change can swap this
+    /// to a true incremental writer; the API is in place so callers
+    /// don't have to change.
+    pub fn finish_to_writer<W: std::io::Write>(self, mut writer: W) -> KrillaResult<()> {
+        let buf = self.finish()?;
+        writer
+            .write_all(&buf)
+            .map_err(|e| crate::error::KrillaError::Io(e.to_string()))
     }
 }

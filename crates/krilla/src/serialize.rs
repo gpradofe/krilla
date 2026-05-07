@@ -266,6 +266,10 @@ pub(crate) struct SerializeContext {
     validation_store: ValidationStore,
     /// The current location, if set.
     pub(crate) location: Option<Location>,
+    /// Pre-serialized tag state stashed by [`crate::tagging::TagSerializer`].
+    /// Picked up by [`crate::tagging::TagTree::serialize_consuming_with_note_id`]
+    /// at end of serialization. `None` when no pre-serialization happened.
+    pub(crate) pre_serialized_tags: Option<crate::tagging::PreSerializedTags>,
 }
 
 impl SerializeContext {
@@ -299,6 +303,7 @@ impl SerializeContext {
             chunk_settings,
             limits: Limits::new(),
             validation_store: ValidationStore::new(),
+            pre_serialized_tags: None,
         }
     }
 
@@ -801,15 +806,28 @@ impl SerializeContext {
         let tag_tree = self.global_objects.tag_tree.take();
         let struct_parents = self.global_objects.struct_parents.take();
         if let Some(root) = &tag_tree {
-            let mut parent_tree_map = HashMap::new();
-            let mut id_tree_map = BTreeMap::new();
+            // Pick up any state stashed by `TagSerializer::finish_into`.
+            // When nothing was pre-serialized this is the default state and
+            // `serialize_with_state` behaves identically to `serialize`.
+            let pre = self
+                .pre_serialized_tags
+                .take()
+                .unwrap_or_else(crate::tagging::PreSerializedTags::new);
+            let pre_doc_ref = pre.document_ref;
+            let pre_chunk = pre.chunk;
+            let mut parent_tree_map = pre.parent_tree_map;
+            let mut id_tree_map = pre.id_tree_map;
+            let start_note_id = pre.note_id;
             let struct_tree_root_ref = self.new_ref();
-            let document_ref = root.serialize(
+            let document_ref = root.serialize_with_state(
                 self,
                 chunk_container,
                 &mut parent_tree_map,
                 &mut id_tree_map,
                 struct_tree_root_ref,
+                start_note_id,
+                pre_doc_ref,
+                pre_chunk,
             )?;
 
             root.validate(&id_tree_map)?;

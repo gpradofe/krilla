@@ -144,6 +144,11 @@ use crate::serialize::SerializeContext;
 
 pub use tag::*;
 
+/// Re-export of `pdf_writer::Ref` so external consumers (e.g. typst-pdf) can
+/// hold pre-allocated refs for [`Node::Ref`] / [`Node::PreAllocGroup`] /
+/// [`TagSerializer`] without a direct dependency on the `pdf-writer` crate.
+pub use pdf_writer::Ref as PdfRef;
+
 pub mod fmt;
 mod tag;
 
@@ -581,6 +586,21 @@ pub enum Node {
     Group(TagGroup),
     /// A leaf node.
     Leaf(Identifier),
+    /// A reference to an already-serialized struct element. Produced by
+    /// [`TagSerializer::serialize_group`] when a subtree is pre-serialized
+    /// during the document build (rather than carried in memory until
+    /// `Document::set_tag_tree`). The resulting parent's children list
+    /// can therefore mix in-memory groups with already-flushed refs.
+    Ref(PdfRef),
+    /// A group node with a pre-allocated [`PdfRef`]. Used when some
+    /// children were pre-serialized with this ref as their `/P` parent
+    /// (typically because they are leaves or refs), but the group itself
+    /// could not be fully pre-serialized — for example because it contains
+    /// an annotation descendant whose page info isn't available yet.
+    /// During tag-tree serialization the supplied ref is used in place of
+    /// allocating a fresh one, so the pre-serialized children's `/P`
+    /// entries stay consistent.
+    PreAllocGroup(PdfRef, TagGroup),
 }
 
 impl Node {
@@ -602,10 +622,26 @@ impl Node {
                 note_id,
                 struct_elems,
             )?)),
+            // PreAllocGroup binds the inner group to a previously allocated
+            // ref so descendants pre-serialized with that ref as their `/P`
+            // parent (typically via [`TagSerializer`]) stay consistent.
+            // Routing through `serialize_with_ref` honors the bound ref;
+            // calling plain `serialize` here would allocate a fresh one and
+            // silently break the pre-serialized children's parent refs.
+            Node::PreAllocGroup(pre_ref, g) => Ok(Some(g.serialize_with_ref(
+                sc,
+                parent_tree_map,
+                id_tree,
+                parent,
+                note_id,
+                struct_elems,
+                *pre_ref,
+            )?)),
             Node::Leaf(ci) => match ci.0 {
                 IdentifierInner::Real(rci) => Ok(Some(Reference::ContentIdentifier(rci))),
                 IdentifierInner::Dummy => Ok(None),
             },
+            Node::Ref(r) => Ok(Some(Reference::Ref(*r))),
         }
     }
 }
@@ -669,6 +705,33 @@ impl TagGroup {
         struct_elems: &mut Chunk,
     ) -> KrillaResult<Reference> {
         let elem_ref = sc.new_ref();
+        self.serialize_with_ref(
+            sc,
+            parent_tree_map,
+            id_tree,
+            parent_ref,
+            note_id,
+            struct_elems,
+            elem_ref,
+        )
+    }
+
+    /// Like [`Self::serialize`] but uses the supplied `elem_ref` as the
+    /// struct element's PDF [`Ref`] instead of allocating a fresh one. Used
+    /// by [`TagSerializer`] to pre-serialize subtrees with refs that were
+    /// allocated earlier (so descendants can refer to the parent ref before
+    /// the parent itself is serialized).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn serialize_with_ref(
+        &self,
+        sc: &mut SerializeContext,
+        parent_tree_map: &mut HashMap<IdentifierType, Ref>,
+        id_tree: &mut BTreeMap<TagId, Ref>,
+        parent_ref: Ref,
+        note_id: &mut u32,
+        struct_elems: &mut Chunk,
+        elem_ref: Ref,
+    ) -> KrillaResult<Reference> {
         let mut children_refs = vec![];
 
         for child in &self.children {
@@ -1032,22 +1095,30 @@ impl TagTree {
         self.children.push(child.into())
     }
 
-    pub(crate) fn serialize(
+    /// Serialize this tag tree, optionally picking up state previously
+    /// stashed by [`TagSerializer::finish_into`]: an optional
+    /// pre-allocated document ref, a partially-populated parent / id
+    /// tree map, and a starting note-id counter. The pre-serialized
+    /// struct-element chunk (if any) is appended to
+    /// `chunk_container.non_stream.struct_elements` after the main chunk
+    /// has been written. Behaves like a vanilla serialization when called
+    /// with default state (`None` ref, empty maps, note-id `1`,
+    /// no pre chunk).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn serialize_with_state(
         &self,
         sc: &mut SerializeContext,
         chunk_container: &mut ChunkContainer,
         parent_tree_map: &mut HashMap<IdentifierType, Ref>,
         id_tree_map: &mut BTreeMap<TagId, Ref>,
         struct_tree_ref: Ref,
+        start_note_id: u32,
+        pre_doc_ref: Option<Ref>,
+        pre_chunk: Option<Chunk>,
     ) -> KrillaResult<Ref> {
-        let root_ref = sc.new_ref();
+        let root_ref = pre_doc_ref.unwrap_or_else(|| sc.new_ref());
         let mut struct_elems = sc.new_chunk();
-
-        // Keeps track of the ID of notes in the IDTree. We currently only write IDs for notes,
-        // which is why we use this simple variable, but this should be refactored if we write
-        // the IDs for multiple types of struct elements in the future.
-        let mut note_id = 1;
-
+        let mut note_id = start_note_id;
         let mut children_refs = vec![];
 
         for child in &self.children {
@@ -1059,7 +1130,6 @@ impl TagTree {
                 &mut note_id,
                 &mut struct_elems,
             )?;
-
             if let Some(ref_) = serialized {
                 children_refs.push(ref_);
             }
@@ -1082,6 +1152,13 @@ impl TagTree {
         )?;
 
         struct_elem.finish();
+
+        // Append pre-serialized struct elements (from TagSerializer) into
+        // the chunk we just built. Single-chunk model: one final
+        // `Option<Chunk>` for `chunk_container.struct_elements`.
+        if let Some(pre) = pre_chunk {
+            struct_elems.extend(&pre);
+        }
         chunk_container.non_stream.struct_elements = Some(struct_elems);
 
         Ok(root_ref)
@@ -1189,6 +1266,150 @@ fn serialize_children(
     }
 
     Ok(())
+}
+
+/// State produced by a [`TagSerializer`] after pre-serializing some tag
+/// subtrees. Stashed on [`SerializeContext`] so the final
+/// [`TagTree::serialize_with_state`] pass can pick up the
+/// pre-allocated document ref, the partially built tree maps, the next
+/// note id, and the in-memory chunk that already holds the
+/// pre-serialized struct elements.
+pub(crate) struct PreSerializedTags {
+    /// Pre-allocated [`Ref`] for the Document struct element.
+    pub(crate) document_ref: Option<Ref>,
+    /// Partial parent-tree map populated during pre-serialization.
+    pub(crate) parent_tree_map: HashMap<IdentifierType, Ref>,
+    /// Partial id-tree map populated during pre-serialization.
+    pub(crate) id_tree_map: BTreeMap<TagId, Ref>,
+    /// Next auto-generated note id.
+    pub(crate) note_id: u32,
+    /// The chunk of pre-serialized struct elements. May be empty (no
+    /// pre-serialized groups). Merged into
+    /// [`ChunkContainer::struct_elements`] at end of
+    /// [`TagTree::serialize_consuming_with_note_id`].
+    pub(crate) chunk: Option<Chunk>,
+}
+
+impl PreSerializedTags {
+    pub(crate) fn new() -> Self {
+        Self {
+            document_ref: None,
+            parent_tree_map: HashMap::new(),
+            id_tree_map: BTreeMap::new(),
+            note_id: 1,
+            chunk: None,
+        }
+    }
+}
+
+/// Streaming pre-serializer for tag subtrees.
+///
+/// Lets a downstream consumer (e.g. `typst-pdf`) write a tag group's
+/// struct element to the PDF body **before** the full tag tree is
+/// committed via `Document::set_tag_tree`. The returned [`PdfRef`]
+/// can be wrapped in [`Node::Ref`] / [`Node::PreAllocGroup`] inside the
+/// final tag tree, so the final tree only needs to carry the references
+/// — not the full subtrees.
+///
+/// Typical usage from a downstream resolver:
+///
+/// 1. `let mut ts = doc.tag_serializer();`
+/// 2. For each leaf-or-near-leaf subtree:
+///    - `let r = ts.new_ref();`
+///    - `ts.serialize_group(group, r, parent_ref)?;`
+///    - In the parent's children list, push `Node::Ref(r)` (or
+///      `Node::PreAllocGroup(r, partial_group)` if the parent group
+///      itself can't yet be flushed).
+/// 3. `ts.finish_into();` — stashes the partial state back on the
+///    serialize context for the final tag-tree pass to pick up.
+/// 4. `doc.set_tag_tree(root)` and `doc.finish()` proceed normally.
+pub struct TagSerializer<'a> {
+    sc: &'a mut SerializeContext,
+    document_ref: Ref,
+    parent_tree_map: HashMap<IdentifierType, Ref>,
+    id_tree_map: BTreeMap<TagId, Ref>,
+    note_id: u32,
+    /// In-memory chunk for pre-serialized struct elements. Merged into
+    /// [`ChunkContainer::struct_elements`] at the end of the final
+    /// tag-tree serialize pass.
+    chunk: Chunk,
+}
+
+impl<'a> TagSerializer<'a> {
+    /// Create a new pre-serializer. Allocates the Document struct
+    /// element [`Ref`] eagerly so root children can reference it as
+    /// their `/P` parent.
+    pub(crate) fn new(sc: &'a mut SerializeContext) -> Self {
+        let document_ref = sc.new_ref();
+        let chunk = sc.new_chunk();
+        Self {
+            sc,
+            document_ref,
+            parent_tree_map: HashMap::new(),
+            id_tree_map: BTreeMap::new(),
+            note_id: 1,
+            chunk,
+        }
+    }
+
+    /// The pre-allocated Document struct element [`Ref`]. Root children
+    /// pre-serialized via [`Self::serialize_group`] should pass this as
+    /// their `parent_ref` so the final tree's `/P` entries match.
+    pub fn document_ref(&self) -> Ref {
+        self.document_ref
+    }
+
+    /// Allocate a new PDF object [`Ref`] from the underlying serialize
+    /// context. Used by callers to pre-allocate refs for groups they
+    /// intend to serialize.
+    pub fn new_ref(&mut self) -> Ref {
+        self.sc.new_ref()
+    }
+
+    /// Serialize a single group, binding it to the given pre-allocated
+    /// [`Ref`]. The group is consumed and its subtree freed when this
+    /// returns. Children may be ordinary [`Node::Group`] (will be
+    /// recursively consumed), [`Node::Leaf`], or [`Node::Ref`] (a
+    /// previously pre-serialized ref) — exactly the same shapes
+    /// supported by the final tag-tree pass.
+    pub fn serialize_group(
+        &mut self,
+        group: TagGroup,
+        elem_ref: Ref,
+        parent_ref: Ref,
+    ) -> KrillaResult<()> {
+        // Delegating to `serialize_with_ref` keeps the per-group attribute
+        // and validation handling identical to the upstream serialize path,
+        // so pre-serialized groups produce byte-identical struct elements
+        // to ones serialized via the final tag-tree pass.
+        group.serialize_with_ref(
+            self.sc,
+            &mut self.parent_tree_map,
+            &mut self.id_tree_map,
+            parent_ref,
+            &mut self.note_id,
+            &mut self.chunk,
+            elem_ref,
+        )?;
+        // `group` is consumed (passed by value) — drops here, freeing the
+        // subtree.
+        Ok(())
+    }
+
+    /// Commit the pre-serialized state back to the serialize context.
+    /// Must be called before `Document::finish`. After this call, the
+    /// final tag-tree serialize pass will pick up `document_ref`,
+    /// `parent_tree_map`, `id_tree_map`, `note_id`, and the accumulated
+    /// pre-serialized chunk.
+    pub fn finish_into(self) {
+        self.sc.pre_serialized_tags = Some(PreSerializedTags {
+            document_ref: Some(self.document_ref),
+            parent_tree_map: self.parent_tree_map,
+            id_tree_map: self.id_tree_map,
+            note_id: self.note_id,
+            chunk: Some(self.chunk),
+        });
+    }
 }
 
 /// Where a layout artifact is attached to the page edge.
