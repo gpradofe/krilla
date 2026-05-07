@@ -589,7 +589,7 @@ pub enum Node {
     /// A reference to an already-serialized struct element. Produced by
     /// [`TagSerializer::serialize_group`] when a subtree is pre-serialized
     /// during the document build (rather than carried in memory until
-    /// [`Document::set_tag_tree`]). The resulting parent's children list
+    /// `Document::set_tag_tree`). The resulting parent's children list
     /// can therefore mix in-memory groups with already-flushed refs.
     Ref(PdfRef),
     /// A group node with a pre-allocated [`PdfRef`]. Used when some
@@ -721,6 +721,7 @@ impl TagGroup {
     /// by [`TagSerializer`] to pre-serialize subtrees with refs that were
     /// allocated earlier (so descendants can refer to the parent ref before
     /// the parent itself is serialized).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn serialize_with_ref(
         &self,
         sc: &mut SerializeContext,
@@ -1094,70 +1095,16 @@ impl TagTree {
         self.children.push(child.into())
     }
 
-    pub(crate) fn serialize(
-        &self,
-        sc: &mut SerializeContext,
-        chunk_container: &mut ChunkContainer,
-        parent_tree_map: &mut HashMap<IdentifierType, Ref>,
-        id_tree_map: &mut BTreeMap<TagId, Ref>,
-        struct_tree_ref: Ref,
-    ) -> KrillaResult<Ref> {
-        let root_ref = sc.new_ref();
-        let mut struct_elems = sc.new_chunk();
-
-        // Keeps track of the ID of notes in the IDTree. We currently only write IDs for notes,
-        // which is why we use this simple variable, but this should be refactored if we write
-        // the IDs for multiple types of struct elements in the future.
-        let mut note_id = 1;
-
-        let mut children_refs = vec![];
-
-        for child in &self.children {
-            let serialized = child.serialize(
-                sc,
-                parent_tree_map,
-                id_tree_map,
-                root_ref,
-                &mut note_id,
-                &mut struct_elems,
-            )?;
-
-            if let Some(ref_) = serialized {
-                children_refs.push(ref_);
-            }
-        }
-
-        let mut struct_elem = struct_elems.indirect(root_ref).start::<StructElement>();
-        struct_elem.kind(StructRole::Document);
-        struct_elem.parent(struct_tree_ref);
-        if let Some(lang) = &self.lang {
-            if sc.serialize_settings().pdf_version() >= PdfVersion::Pdf14 {
-                struct_elem.lang(TextStr(lang));
-            }
-        }
-        serialize_children(
-            sc,
-            root_ref,
-            children_refs,
-            parent_tree_map,
-            &mut struct_elem,
-        )?;
-
-        struct_elem.finish();
-        chunk_container.non_stream.struct_elements = Some(struct_elems);
-
-        Ok(root_ref)
-    }
-
-    /// Variant of [`Self::serialize`] that picks up state previously
+    /// Serialize this tag tree, optionally picking up state previously
     /// stashed by [`TagSerializer::finish_into`]: an optional
     /// pre-allocated document ref, a partially-populated parent / id
     /// tree map, and a starting note-id counter. The pre-serialized
     /// struct-element chunk (if any) is appended to
-    /// `chunk_container.struct_elements` after the main chunk has been
-    /// written. Behaves exactly like [`Self::serialize`] when called
+    /// `chunk_container.non_stream.struct_elements` after the main chunk
+    /// has been written. Behaves like a vanilla serialization when called
     /// with default state (`None` ref, empty maps, note-id `1`,
     /// no pre chunk).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn serialize_with_state(
         &self,
         sc: &mut SerializeContext,
@@ -1212,7 +1159,7 @@ impl TagTree {
         if let Some(pre) = pre_chunk {
             struct_elems.extend(&pre);
         }
-        chunk_container.struct_elements = Some(struct_elems);
+        chunk_container.non_stream.struct_elements = Some(struct_elems);
 
         Ok(root_ref)
     }
@@ -1359,7 +1306,7 @@ impl PreSerializedTags {
 ///
 /// Lets a downstream consumer (e.g. `typst-pdf`) write a tag group's
 /// struct element to the PDF body **before** the full tag tree is
-/// committed via [`Document::set_tag_tree`]. The returned [`PdfRef`]
+/// committed via `Document::set_tag_tree`. The returned [`PdfRef`]
 /// can be wrapped in [`Node::Ref`] / [`Node::PreAllocGroup`] inside the
 /// final tag tree, so the final tree only needs to carry the references
 /// — not the full subtrees.
@@ -1374,8 +1321,7 @@ impl PreSerializedTags {
 ///      `Node::PreAllocGroup(r, partial_group)` if the parent group
 ///      itself can't yet be flushed).
 /// 3. `ts.finish_into();` — stashes the partial state back on the
-///    [`SerializeContext`] for the final
-///    [`TagTree::serialize_consuming_with_note_id`] to pick up.
+///    serialize context for the final tag-tree pass to pick up.
 /// 4. `doc.set_tag_tree(root)` and `doc.finish()` proceed normally.
 pub struct TagSerializer<'a> {
     sc: &'a mut SerializeContext,
@@ -1413,9 +1359,9 @@ impl<'a> TagSerializer<'a> {
         self.document_ref
     }
 
-    /// Allocate a new PDF object [`Ref`] from the underlying
-    /// [`SerializeContext`]. Used by callers to pre-allocate refs for
-    /// groups they intend to serialize.
+    /// Allocate a new PDF object [`Ref`] from the underlying serialize
+    /// context. Used by callers to pre-allocate refs for groups they
+    /// intend to serialize.
     pub fn new_ref(&mut self) -> Ref {
         self.sc.new_ref()
     }
@@ -1450,8 +1396,8 @@ impl<'a> TagSerializer<'a> {
         Ok(())
     }
 
-    /// Commit the pre-serialized state back to the [`SerializeContext`].
-    /// Must be called before [`Document::finish`]. After this call, the
+    /// Commit the pre-serialized state back to the serialize context.
+    /// Must be called before `Document::finish`. After this call, the
     /// final tag-tree serialize pass will pick up `document_ref`,
     /// `parent_tree_map`, `id_tree_map`, `note_id`, and the accumulated
     /// pre-serialized chunk.

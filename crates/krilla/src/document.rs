@@ -116,20 +116,20 @@ impl Document {
         self.serializer_context.set_tag_tree(tag_tree);
     }
 
-    /// Open a streaming [`TagSerializer`].
+    /// Open a streaming `TagSerializer`.
     ///
-    /// Returns a borrowed serializer over this document's
-    /// [`SerializeContext`]. Use it to pre-serialize tag subtrees while
-    /// the document is being built (e.g. flushing each table row as the
-    /// document author finishes writing that row), instead of holding
-    /// the whole tag tree in memory until [`Self::set_tag_tree`].
+    /// Returns a borrowed serializer over this document's serialize
+    /// context. Use it to pre-serialize tag subtrees while the document
+    /// is being built (e.g. flushing each table row as the document
+    /// author finishes writing that row), instead of holding the whole
+    /// tag tree in memory until [`Self::set_tag_tree`].
     ///
-    /// Refs returned by [`TagSerializer::new_ref`] /
-    /// [`TagSerializer::document_ref`] should be wrapped in
-    /// [`crate::tagging::Node::Ref`] / [`crate::tagging::Node::PreAllocGroup`]
-    /// inside the final tag tree handed to [`Self::set_tag_tree`].
-    /// Call [`TagSerializer::finish_into`] before [`Self::finish`] to
-    /// commit the pre-serialized state back to this document.
+    /// Refs returned by `TagSerializer::new_ref` / `TagSerializer::document_ref`
+    /// should be wrapped in [`crate::tagging::Node::Ref`] /
+    /// [`crate::tagging::Node::PreAllocGroup`] inside the final tag tree
+    /// handed to [`Self::set_tag_tree`]. Call `TagSerializer::finish_into`
+    /// before [`Self::finish`] to commit the pre-serialized state back to
+    /// this document.
     pub fn tag_serializer(&mut self) -> crate::tagging::TagSerializer<'_> {
         crate::tagging::TagSerializer::new(&mut self.serializer_context)
     }
@@ -175,7 +175,7 @@ impl Document {
     /// Variant of [`Self::finish`] that streams the final PDF body to a
     /// [`std::io::Write`] target instead of returning a `Vec<u8>`.
     ///
-    /// This is the entry point [`typst-pdf`] uses to write the PDF
+    /// This is the entry point `typst-pdf` uses to write the PDF
     /// directly to disk without holding the whole serialized buffer in
     /// memory. The current implementation calls [`Self::finish`]
     /// internally and writes the resulting buffer in one shot — i.e.
